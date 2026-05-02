@@ -1,0 +1,73 @@
+###############################################################################
+# Athena Xai v1 — Dockerfile.tts
+# Jetson Orin Nano Super 8GB / JetPack 6.2 / CUDA 12.6
+#
+# SELF-CONTAINED: Kokoro-82M TTS on GPU via onnxruntime CUDAExecutionProvider.
+# Own copy of CUDA toolkit libs. Own copy of onnxruntime-gpu.
+# NO torch. NO silero-vad. NO llama/whisper binaries. NO misaki.
+#
+# Asian / non-Latin Path B is handled UPSTREAM in the orchestrator via a
+# two-pass LLM flow (translate, then convert foreign text to English
+# letters), routed to TTS with lang="en-us" from llm_config.json. Kokoro
+# and espeak-ng only ever see English-letter text on those paths.
+#
+# Install order:
+#   1. kokoro-onnx (pulls onnxruntime CPU + numpy 2.x as deps)
+#   2. Force numpy <2 (Jetson ORT GPU needs 1.x)
+#   3. Swap onnxruntime CPU → onnxruntime-gpu Jetson wheel
+#   4. Remaining deps (scipy, soundfile, etc.)
+#   5. Build verification (actually test CUDA session creation)
+###############################################################################
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# System packages — Python + audio + espeak (phonemizer backend for English)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
+    libsndfile1 espeak-ng curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA toolkit shared libraries from host JetPack installation
+# These are needed by onnxruntime's CUDAExecutionProvider at runtime.
+COPY cuda-libs/ /usr/local/lib/cuda/
+RUN echo "/usr/local/lib/cuda" > /etc/ld.so.conf.d/cuda-toolkit.conf && ldconfig
+
+# Block torch from being pulled by any pip install
+COPY constraints-docker.txt /tmp/constraints.txt
+ENV PIP_CONSTRAINT=/tmp/constraints.txt
+
+# Step 1: Install kokoro-onnx (pulls numpy 2.x, onnxruntime CPU, phonemizer)
+RUN pip3 install --no-cache-dir kokoro-onnx==0.5.0 2>&1 | tail -5
+
+# Step 2: Force numpy <2 (Jetson onnxruntime-gpu 1.20.x compiled against numpy 1.x)
+RUN pip3 install --no-cache-dir --force-reinstall "numpy>=1.24.0,<2.0.0" 2>&1 | tail -3
+
+# Step 3: Swap onnxruntime CPU → onnxruntime-gpu Jetson wheel
+COPY onnxruntime_gpu-*.whl /tmp/
+RUN pip3 uninstall -y onnxruntime \
+    && pip3 install --no-cache-dir --no-deps /tmp/onnxruntime_gpu-*.whl \
+    && rm /tmp/onnxruntime_gpu-*.whl
+
+# Step 4: Remaining TTS deps
+COPY requirements-tts.txt /tmp/
+RUN pip3 install --no-cache-dir -r /tmp/requirements-tts.txt 2>&1 | tail -3
+
+# Step 5: Build verification — ACTUALLY TEST CUDA, don't just list providers
+RUN python3 -c "\
+import sys; print(f'Python: {sys.version}'); \
+import numpy; print(f'numpy: {numpy.__version__}'); \
+import onnxruntime as ort; print(f'onnxruntime: {ort.__version__}'); \
+avail = ort.get_available_providers(); print(f'Available: {avail}'); \
+assert 'CUDAExecutionProvider' in avail, f'CUDA EP not available: {avail}'; \
+from kokoro_onnx import Kokoro; print('kokoro_onnx: OK'); \
+import soundfile; print(f'soundfile: {soundfile.__version__}'); \
+print('BUILD VERIFICATION: PASS')" 2>&1 \
+    && echo "TTS image build OK"
+
+# Copy application code
+COPY tts/ /app/tts/
+WORKDIR /app
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/cuda

@@ -1,0 +1,193 @@
+###############################################################################
+# Athena Xai v1 — Docker Compose
+# Jetson Orin Nano Super 8GB / JetPack 6.2 / CUDA 12.6
+#
+# 3 SEPARATE IMAGES — each fully self-contained with own CUDA libs.
+# GPU: runtime: nvidia — each container gets its own CUDA context.
+#
+# CONTAINERS:
+#   athena-tts          Kokoro-82M ONNX on GPU (port 8002)  [athena-tts:latest]
+#   athena-whisper      whisper.cpp small q8_0 multilingual on GPU (port 8001) [athena-whisper:latest]
+#   athena-orchestrator Silero VAD (CPU) + LLM (GPU) + pipeline [athena-orch:latest]
+#
+# v47: LLM via llama-cpp-python (pre-built wheel from host).
+#      System prompt + LLM params in llm_config.json (one file, tunable).
+#      GGML_CUDA_NO_PINNED=1 for Jetson unified memory.
+#      3 containers.
+###############################################################################
+
+services:
+
+  athena-tts:
+    image: athena-tts:latest
+    container_name: athena-tts
+    network_mode: host
+    runtime: nvidia
+    restart: on-failure:1
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - LD_LIBRARY_PATH=/usr/local/lib/cuda
+    volumes:
+      - ${ATHENA_HOME}/models:/models:ro
+      - ${ATHENA_HOME}/logs:/logs
+    command:
+      - bash
+      - -c
+      - |
+        set -o pipefail
+        echo "[athena-tts] Waiting 5s for GPU settle..."
+        sleep 5
+        ldconfig 2>/dev/null
+        echo "=========================================="
+        echo "[athena-tts] Kokoro-82M TTS (GPU)"
+        echo "  Port:     8002"
+        echo "  Endpoint: POST /synthesize"
+        echo "=========================================="
+        ls -lh /models/tts/ 2>&1 || echo "  ERROR: /models/tts/ not found!"
+        python3 -c "import onnxruntime as ort; print(f'  ORT Providers: {ort.get_available_providers()}')" 2>&1
+        echo "=========================================="
+        exec python3 /app/tts/tts_server.py \
+          --port 8002 \
+          --model-dir /models/tts \
+          2>&1 | tee -a /logs/tts.log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  athena-whisper:
+    image: athena-whisper:latest
+    container_name: athena-whisper
+    network_mode: host
+    runtime: nvidia
+    restart: on-failure:1
+    shm_size: '256m'
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - LD_LIBRARY_PATH=/usr/local/lib/cuda:/usr/local/lib
+    volumes:
+      - ${ATHENA_HOME}/models:/models:ro
+      - ${ATHENA_HOME}/logs:/logs
+    command:
+      - bash
+      - -c
+      - |
+        set -o pipefail
+        echo "[athena-whisper] Waiting 5s for GPU settle..."
+        sleep 5
+        ldconfig 2>/dev/null
+        echo "=========================================="
+        echo "[athena-whisper] Whisper small Q8_0 (GPU, multilingual)"
+        echo "  Port:     8001"
+        echo "  Endpoint: POST /inference"
+        echo "  Model:    ggml-small-q8_0.bin (multilingual, language per-request, translate-capable)"
+        echo "=========================================="
+        ls -lh /models/whisper/ 2>&1 || echo "  ERROR: /models/whisper/ not found!"
+        echo "=========================================="
+        exec whisper-server \
+          --model /models/whisper/ggml-small-q8_0.bin \
+          --port 8001 \
+          --host 0.0.0.0 \
+          --threads 4 \
+          --processors 1 \
+          --print-progress \
+          --print-realtime \
+          --convert \
+          2>&1 | tee -a /logs/whisper.log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+
+  athena-orchestrator:
+    image: athena-orch:latest
+    container_name: athena-orchestrator
+    network_mode: host
+    runtime: nvidia
+    restart: "no"
+    shm_size: '1g'
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    devices:
+      - /dev/snd:/dev/snd
+    volumes:
+      - ${ATHENA_HOME}/models:/models:ro
+      - ${ATHENA_HOME}/logs:/logs
+      - ${ATHENA_HOME}/llm_config.json:/app/llm_config.json:ro
+      # v57: PulseAudio is gone. Output goes through PortAudio→ALSA via /dev/snd
+      # (already mounted above). Same path the mic uses — no socket, no cookie,
+      # no auth. Removed: /run/user/1000/pulse mount, cookie mount,
+      # PULSE_SERVER, PULSE_COOKIE, ATHENA_HEADSET_SINK, ATHENA_EXTERNAL_SINK.
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - LD_LIBRARY_PATH=/usr/local/lib/cuda
+      - GGML_CUDA_NO_PINNED=1
+      - ATHENA_LLM_MODEL=/models/llm/Huihui-gemma-4-E2B-it-abliterated-v2.Q4_K_M.gguf
+      - ATHENA_WHISPER_URL=http://localhost:8001
+      - ATHENA_TTS_URL=http://localhost:8002
+      - ATHENA_LOG_DIR=/logs
+      - ATHENA_VAD_MODEL=/models/vad/silero_vad.onnx
+      - ATHENA_TTS_VOICE=af_sky
+      - ATHENA_TTS_SPEED=1.0
+      - ATHENA_VAD_THRESHOLD=0.5
+      - ATHENA_SILENCE_TIMEOUT=0.8
+      - ATHENA_MIC_RATE=48000
+      - ATHENA_WHISPER_RATE=16000
+      - ATHENA_MIN_SPEECH_FRAMES=8
+    command:
+      - bash
+      - -c
+      - |
+        set -o pipefail
+        echo "=========================================="
+        echo "[athena-orchestrator] System Diagnostic"
+        echo "=========================================="
+        ldconfig 2>/dev/null
+        echo ""
+
+        # Show ORT providers available (should include CUDA)
+        python3 -c "import onnxruntime as ort; print(f'  ORT Providers: {ort.get_available_providers()}')" 2>&1
+
+        # Show llama-cpp-python version
+        python3 -c "import llama_cpp; print(f'  llama-cpp-python: {llama_cpp.__version__}')" 2>&1
+
+        # Show LLM config
+        python3 -c "
+        import json
+        try:
+            with open('/app/llm_config.json') as f:
+                cfg = json.load(f)
+            print(f'  LLM Config:')
+            for k, v in cfg.items():
+                val = repr(v)[:60]
+                print(f'    {k}: {val}')
+        except Exception as e:
+            print(f'  LLM Config: default (no config file: {e})')
+        " 2>&1
+        echo ""
+
+        # v47: LLM loads FIRST into clean memory. TTS+Whisper start after.
+        # Pipeline waits for TTS+Whisper internally before entering listen loop.
+        echo "=========================================="
+        echo "  Loading LLM FIRST (clean contiguous memory)"
+        echo "=========================================="
+        echo "  LLM: direct load via llama-cpp-python"
+        echo "  VAD: Silero ONNX on CPU"
+        echo "  Config: /app/llm_config.json"
+        echo "  TTS+Whisper: pipeline waits for them after LLM loads"
+        echo ""
+
+        # v59: audio gateway removed. It only existed to manage PulseAudio
+        # default sinks, but v57 dropped PulseAudio entirely (output goes
+        # PortAudio → ALSA). The gateway has nothing to do.
+
+        # Start pipeline — loads LLM first, then waits for services
+        python3 /app/orchestrator/athena_pipeline.py 2>&1 | tee -a /logs/orchestrator.log

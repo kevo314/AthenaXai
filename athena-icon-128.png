@@ -1,0 +1,14 @@
+# Athena Xai v1 — Docker build context exclusions
+# Placed in docker-staging/ to exclude non-build files from context transfer.
+#
+# Note: cuda-libs/ (2.5GB) cannot be excluded — all 4 Dockerfiles COPY it.
+# The main savings come from excluding stray files that accumulate in staging.
+*.log
+*.md
+*.txt.bak
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo

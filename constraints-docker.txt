@@ -1,0 +1,75 @@
+#!/bin/bash
+###############################################################################
+# Athena v44 — chat_athena.sh
+# Text-only chat with the LLM inside the running orchestrator container.
+# Bypasses VAD/Whisper/TTS — pure text in, text out.
+# Useful for testing the brain without a microphone.
+#
+# Requires: athena-orchestrator container running (start athena.sh first)
+###############################################################################
+
+ATHENA_HOME="$HOME/athena"
+
+echo "============================================"
+echo "  Athena Xai v1 — Text Chat"
+echo "============================================"
+echo ""
+
+# Check if orchestrator container is running
+if ! sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q "athena-orchestrator"; then
+    echo "  ERROR: athena-orchestrator not running."
+    echo "  Start athena.sh first."
+    exit 1
+fi
+
+echo "  Connected to LLM via orchestrator container."
+echo "  Type 'quit' to exit."
+echo ""
+
+while true; do
+    read -p "You: " INPUT
+    [ -z "$INPUT" ] && continue
+    [ "$INPUT" = "quit" ] || [ "$INPUT" = "exit" ] && echo "Goodbye." && break
+
+    # Run a one-shot LLM query inside the container
+    RESPONSE=$(sudo docker exec athena-orchestrator python3 -c "
+import json, os
+os.environ.setdefault('GGML_CUDA_NO_PINNED', '1')
+
+# Load config
+cfg = {}
+try:
+    with open('/app/llm_config.json') as f:
+        cfg = json.load(f)
+except: pass
+
+from llama_cpp import Llama
+model_path = os.environ.get('ATHENA_LLM_MODEL', '/models/llm/Huihui-gemma-4-E2B-it-abliterated-v2.Q4_K_M.gguf')
+llm = Llama(
+    model_path=model_path,
+    n_ctx=cfg.get('n_ctx', 4096),
+    n_gpu_layers=cfg.get('n_gpu_layers', 99),
+    n_batch=cfg.get('n_batch', 128),
+    verbose=False,
+)
+messages = [
+    {'role': 'system', 'content': cfg.get('system_prompt', 'You are Athena.')},
+    {'role': 'user', 'content': '''${INPUT}'''},
+]
+resp = llm.create_chat_completion(
+    messages=messages,
+    temperature=cfg.get('temperature', 0.2),
+    top_p=cfg.get('top_p', 0.3),
+    top_k=cfg.get('top_k', 5),
+    max_tokens=cfg.get('max_tokens', 1024),
+)
+reply = resp['choices'][0]['message'].get('content', '')
+import re
+reply = re.sub(r'<\|channel\|?>thought\s*.*?<\|?/?channel\|?>', '', reply, flags=re.DOTALL).strip()
+print(reply)
+" 2>/dev/null)
+
+    echo ""
+    echo "Athena: $RESPONSE"
+    echo ""
+done

@@ -1,0 +1,7 @@
+# Athena Xai v1 — Docker pip constraints
+# Blocks torch from being pulled by ANY pip install as a transitive dep.
+# (silero-vad's pip package would otherwise pull torch + nvidia-cublas-13.x
+# and break CUDA 12 compatibility on Jetson.)
+torch==99999.0.0
+torchaudio==99999.0.0
+torchvision==99999.0.0

@@ -1,0 +1,8 @@
+# Athena Xai v1 — Orchestrator container dependencies
+# onnxruntime-gpu installed separately in Dockerfile (Jetson wheel)
+# numpy <2 installed separately in Dockerfile
+scipy==1.15.3
+sounddevice==0.5.5
+soundfile==0.13.1
+requests==2.33.0
+cffi==2.0.0

@@ -1,0 +1,153 @@
+# Athena Xai v1 — File Inventory
+
+Everything in the package, what it does, and how it connects to the rest.
+
+---
+
+## Top-level scripts (host)
+
+### `athena.sh`
+The master launcher. Run this from `~/athena/` on the Jetson to bring the full stack up. It handles, in order:
+
+1. System cleanup (drops caches, kills any old Athena containers).
+2. Install/refresh of host-side scripts and the Athena desktop icon.
+3. Creates the `~/athena/logs/` directory and sets the Jetson power mode to `MAXN`.
+4. Configures NVMe swap (16 GB swapfile) and tunes VM parameters (swappiness, dirty ratios, etc.) to favour the LLM.
+5. Verifies Docker NVIDIA runtime is registered.
+6. Builds the host-side llama.cpp + whisper.cpp tools (cached).
+7. Builds the llama-cpp-python wheel (cached).
+8. Downloads required model files (Gemma 4 GGUF, Whisper Q8_0, Silero VAD ONNX, Kokoro ONNX + voices).
+9. Stages the JetPack CUDA libraries into the build context.
+10. Builds the three Docker images (`athena-whisper`, `athena-tts`, `athena-orchestrator`) — only what changed.
+11. Starts the LLM-orchestrator container first (so it gets clean contiguous GPU memory for the LLM), then the TTS and Whisper containers (smaller allocations fill the gaps).
+12. Captures memory snapshots before/after each phase to `logs/memory_phases.log`.
+13. Tails the orchestrator logs in the foreground so the operator sees what Athena is doing.
+
+A pass/fail summary is written to `logs/build_report.log` at the end.
+
+### `stop_athena.sh`
+Stops all three containers via `docker compose down`, drops Linux caches, and frees GPU memory. Use before reboot or before re-running `athena.sh`.
+
+### `test_athena.sh`
+Health probe. Hits `/health` on the Whisper and TTS HTTP servers and verifies the orchestrator container is running. Quick "is the stack alive" check.
+
+### `chat_athena.sh`
+Text-only REPL into the running orchestrator. Lets you type prompts into a terminal and see Athena's text replies without going through mic/Whisper. Useful for testing the LLM and system prompts in isolation.
+
+### `preview_voices.sh`
+Auditions every Kokoro voice. Sends a sample sentence to the TTS server for each voice in turn and plays the result. Helps pick a voice for the Settings menu.
+
+### `memory_diag.sh`
+On-demand memory report. Shows physical RAM, swap, /proc/meminfo key fields, /proc/buddyinfo (contiguous block availability), tegrastats lfb (largest free GPU-allocatable block), Docker container memory (annotated, since Jetson unified memory makes container totals deceptive), and a "Headroom" summary line. Output is printed to stdout; `athena.sh` also redirects it to `logs/memory_phases.log` at lifecycle checkpoints.
+
+---
+
+## Container build inputs
+
+### `Dockerfile.orchestrator`
+Builds the `athena-orchestrator` image. Ubuntu 22.04 base. Installs Python, copies in the JetPack CUDA libs, the pre-built llama-cpp-python wheel, the Silero VAD ONNX runtime deps, and the orchestrator Python source. The orchestrator loads the LLM directly via llama-cpp-python (no separate LLM container) — this saves memory and a hop.
+
+### `Dockerfile.tts`
+Builds the `athena-tts` image. Ubuntu 22.04 base. Installs `kokoro-onnx==0.5.0`, force-downgrades NumPy to <2 (Jetson onnxruntime-gpu 1.20 was compiled against NumPy 1.x), swaps in the Jetson-specific onnxruntime-gpu wheel, and runs a build verification step that imports `kokoro_onnx`, asserts CUDA is available, and prints versions. **No misaki, no torch.** Asian/non-Latin output is handled upstream in the orchestrator via a two-pass LLM flow, so Kokoro/espeak only ever sees English-letter text on those paths.
+
+### `Dockerfile.whisper`
+Builds the `athena-whisper` image. Wraps the host-built `whisper.cpp` server binary with the Whisper small Q8_0 multilingual model. Listens on port 8001 with a `/inference` HTTP endpoint and a `/health` endpoint.
+
+### `docker-compose.yml`
+Wires the three containers together:
+- All three get NVIDIA runtime + GPU access.
+- Orchestrator gets the host audio devices passed in (`/dev/snd`, USB audio device nodes), and the host-side log directory mounted at `/logs`.
+- Whisper and TTS expose ports 8001 and 8002 to the orchestrator on the same Docker network.
+- All three share a `models/` volume so the GGUF, Whisper, Silero, and Kokoro files are visible inside each container that needs them.
+
+### `constraints-docker.txt`
+A pip constraint file pinning `torch`, `torchaudio`, `torchvision` to an impossible version (`99999.0.0`). Mounted via `PIP_CONSTRAINT` during every container build to guarantee no transitive dependency accidentally pulls a CUDA-13 torch wheel that would break our CUDA 12 stack on Jetson.
+
+### `requirements-orch.txt`
+Orchestrator's pip requirements (everything not installed separately by the Dockerfile): `scipy`, `sounddevice`, `soundfile`, `requests`, `cffi`. NumPy and onnxruntime-gpu are installed separately in the Dockerfile so we control versions exactly.
+
+### `requirements-tts.txt`
+TTS's pip requirements (after `kokoro-onnx` is installed and NumPy is pinned): `soundfile`, `requests`. Same reason as above — version-sensitive ones live in the Dockerfile.
+
+### `.dockerignore`
+Excludes logs, README, .env, .git, and Python caches from the Docker build context to keep transfers lean.
+
+---
+
+## Configuration
+
+### `llm_config.json`
+The single source of truth for all runtime behaviour the orchestrator reads at startup:
+
+- **System prompts** for `system_prompt` (conversation), `adult_prompt` (adult mode), and `translate_prompt` (Path B's pass-1 translate template).
+- **Sampling**: `temperature`, `top_p`, `top_k` (Gemma 4 official only). Plus `n_ctx`, `n_gpu_layers`, `n_batch` for the LLM loader.
+- **Audio device patterns**: `headset_alsa_pattern`, `external_alsa_pattern` — substrings the orchestrator uses to look up PortAudio device indexes at startup.
+- **Streaming flag**, **TTS chunk size**, **translate language auto-lock count**.
+- **`voice_options`** — friendly nicknames mapping to Kokoro voice IDs for the Settings menu.
+- **`speed_grid`** — the 1–9 step values used by `voice speed` and `translation speed`.
+- **`path_b_voice_table`** — the big map. For every Whisper-detectable language, gives `lang` (passed to Kokoro/espeak), `female` voice ID, `male` voice ID, and `bucket` (groups languages by voice family). Non-Latin entries (chinese, japanese, korean, hindi-bucket, thai/lao/khmer/burmese/tibetan, etc.) carry `lang="en-us"` because the two-pass flow converts them to English letters before TTS. Latin entries (spanish, italian, portuguese, french, etc.) keep their native lang code for direct espeak phonemization.
+- **`translation_voice_gender_default`** — `"male"` or `"female"`, the default until the user picks.
+
+### `Athena.desktop`
+Linux desktop launcher icon for `athena.sh` — drops on the GNOME desktop after `athena.sh` runs once.
+
+### `athena-icon*.png`
+Icon files at 64/128/256/full resolutions for the desktop launcher and any other UI surface that wants them.
+
+---
+
+## Source
+
+### `orchestrator/athena_pipeline.py`
+The entire orchestrator. Single Python file, runs as the foreground process inside `athena-orchestrator`. Major sections:
+
+- **Config loader** — reads `llm_config.json` and merges with code defaults.
+- **Voice router constants** — wake/stop phrases, mode-switch phrases, settings phrases, Athena fuzzy variants, the language map.
+- **Logging setup** — `pipeline.log`, `translation.log`, `memory_phases.log`.
+- **`SileroVAD` class** — wraps the Silero v5 ONNX model with the 64-sample context window it requires.
+- **`extract_thinking`** is gone in this version. So is the streaming "thinking gate". TTS receives the LLM's full output verbatim; conversation history saves it verbatim.
+- **`clean_for_tts`** — strips markdown, special tokens, expands numbers; same shape it's been for many releases.
+- **`numbers_to_words`** + helpers — converts digit groups (5,280 → five thousand two hundred eighty, 1609.34 → one thousand six hundred nine point three four) so Kokoro pronounces numbers correctly instead of saying "five comma two eight zero".
+- **`split_for_tts`** — splits long replies on sentence boundaries before sending to TTS so each chunk stays under Kokoro's preferred input size.
+- **`send_to_whisper`** — POSTs WAV bytes to the Whisper server, returns `(text, detected_lang)`.
+- **`send_to_llm`** + **`stream_llm_to_tts`** — non-streaming and streaming LLM call paths. Both use llama-cpp-python's `create_chat_completion`. The streaming path runs `[llm-raw-full]` diagnostic logging and feeds a sentence queue that a worker thread converts to TTS audio.
+- **`send_to_tts`** — POSTs text to the Kokoro HTTP server with voice/speed/lang fields; returns WAV bytes.
+- **`play_to_device`** — PortAudio `sd.play` with client-side resampling 24kHz → device rate.
+- **`memory_snapshot`** — writes an in-container memory snapshot to `memory_phases.log` (warm-idle and per-turn).
+- **`main()`** — the giant control loop. Loads VAD + LLM, queries audio devices, restores persisted Settings, plays the welcome greeting, then sits in the read-loop:
+  - Mic chunks come in via the PortAudio callback queue.
+  - VAD gates speech detection; once confirmed, audio gets shipped to Whisper.
+  - The voice router checks the transcript for stops, wakes, mode-switches, and settings menu phrases.
+  - Anything that survives the router is forwarded to the LLM.
+  - The reply goes to TTS (with the right voice/lang/device for the current mode and path).
+  - Path B's two-pass for non-Latin script targets is implemented here: when `tgt_bucket in ("chinese", "japanese", "hindi")`, after the existing translate pass the foreign text gets a second LLM call through `ASIAN_OVERRIDE_PROMPT` ("Only phonemize this to English characters. do not respond and do not translate to English."). The result replaces the reply for the TTS step. The voices for these buckets are American (`am_michael` / `af_heart`) directly in the `path_b_voice_table`, so no runtime override is needed.
+  - Per-turn thinking trigger: before the LLM call in conversation/adult mode, if the user utterance contains the whole word "think", `conversation[0]["content"]` is set to `"<|think|>" + base_prompt`. Otherwise `base_prompt` alone.
+
+### `orchestrator/audio_gateway.sh`
+Legacy holdover from the PulseAudio era — currently unused (PortAudio direct-to-ALSA replaced PulseAudio in an earlier release). Kept in the package for reference.
+
+### `tts/tts_server.py`
+The Kokoro TTS HTTP server. Standalone Python `http.server` with a thread pool. On startup it loads `kokoro-v1.0.onnx` + `voices-v1.0.bin` onto the GPU via onnxruntime's CUDA execution provider, hard-fails if CUDA isn't actually active (no silent CPU fallback), then listens on port 8002. Endpoints:
+
+- `POST /synthesize` — JSON body with `text`, `voice`, `speed`, `lang`. Returns WAV audio bytes.
+- `GET /voices` — lists every Kokoro voice loaded.
+- `GET /health` — returns engine info + active providers (used by `test_athena.sh` and the orchestrator's startup wait).
+
+Calls `kokoro_instance.create(text, voice=voice, speed=speed, lang=lang)` — single path, no per-language routing in the server. The orchestrator delivers English-letter text on Asian/non-Latin paths via the two-pass flow described above.
+
+---
+
+## Logs (generated at runtime, not part of the package)
+
+These files appear in `~/athena/logs/` after the first run:
+
+- `pipeline.log` — orchestrator's primary event log
+- `translation.log` — Path A and Path B per-turn records
+- `memory_phases.log` — memory snapshots at lifecycle checkpoints + per-turn during a session
+- `whisper.log` — Whisper container stdout
+- `tts.log` — TTS container stdout
+- `orchestrator.log` — full orchestrator container stdout
+- `build_report.log` — most recent build pass/fail summary
+- `stack_<TIMESTAMP>.log` — the tee of `docker compose logs` per launch
+- `docker_build_athena-{tts,whisper,orch}_<TIMESTAMP>.log` — build output captured from each Docker build invocation
+- `.athena_runtime.json` — persisted Settings (audio output, voice, speeds, translation gender)

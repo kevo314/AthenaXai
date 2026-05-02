@@ -1,0 +1,81 @@
+###############################################################################
+# Athena Xai v1 — Dockerfile.orchestrator
+# Jetson Orin Nano Super 8GB / JetPack 6.2 / CUDA 12.6
+#
+# SELF-CONTAINED: Pipeline orchestrator with LLM + Silero VAD.
+# LLM loaded directly via llama-cpp-python (no separate llama-server).
+# onnxruntime-gpu for Silero VAD (forced to CPU to save GPU for LLM).
+#
+# Own copy of CUDA toolkit libs. Own copy of onnxruntime-gpu.
+# NO torch. NO kokoro-onnx. NO whisper binaries.
+#
+# v47: llama-cpp-python installed from pre-built host wheel (not compiled
+#      inside Docker). Wheel built on host where full CUDA toolkit exists.
+#      Removed cmake/build-essential/ninja from Docker build.
+#      Full pip output (no tail piping) for better error visibility.
+#
+# Mic (48kHz) → Silero VAD (CPU) → Whisper (HTTP)
+#             → LLM (direct, GPU) → TTS (HTTP) → Speaker
+###############################################################################
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# System packages — Python + audio capture/playback
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
+    portaudio19-dev libsndfile1 \
+    alsa-utils pulseaudio-utils libpulse0 \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA toolkit shared libraries from host JetPack installation
+# Needed by onnxruntime CUDAExecutionProvider (available but VAD forced to CPU).
+COPY cuda-libs/ /usr/local/lib/cuda/
+RUN echo "/usr/local/lib/cuda" > /etc/ld.so.conf.d/cuda-toolkit.conf && ldconfig
+
+# Block torch from being pulled by any pip install
+COPY constraints-docker.txt /tmp/constraints.txt
+ENV PIP_CONSTRAINT=/tmp/constraints.txt
+
+# Step 1: Install numpy <2 (Jetson ORT compiled against numpy 1.x)
+RUN pip3 install --no-cache-dir "numpy>=1.24.0,<2.0.0" 2>&1
+
+# Step 2: Install onnxruntime-gpu Jetson wheel (for Silero VAD on CUDA)
+COPY onnxruntime_gpu-*.whl /tmp/
+RUN pip3 install --no-cache-dir --no-deps /tmp/onnxruntime_gpu-*.whl \
+    && rm /tmp/onnxruntime_gpu-*.whl
+
+# Step 3: Install llama-cpp-python from pre-built host wheel
+# Wheel was built on host with full CUDA toolkit (CMAKE_ARGS="-DGGML_CUDA=on")
+# and cached in docker-staging/. No compilation needed inside Docker.
+COPY llama_cpp_python-*.whl /tmp/
+RUN pip3 install --no-cache-dir /tmp/llama_cpp_python-*.whl \
+    && rm /tmp/llama_cpp_python-*.whl
+
+# Step 4: Remaining orchestrator deps
+COPY requirements-orch.txt /tmp/
+RUN pip3 install --no-cache-dir -r /tmp/requirements-orch.txt 2>&1
+
+# Step 5: Build verification
+# NOTE: llama_cpp cannot be imported during docker build — it loads libllama.so
+# which links against libcuda.so.1 (GPU driver). The driver is only available at
+# runtime via 'runtime: nvidia'. Use importlib.metadata to verify installation.
+RUN python3 -c "\
+import sys; print(f'Python: {sys.version}'); \
+import numpy; print(f'numpy: {numpy.__version__}'); \
+import onnxruntime as ort; print(f'onnxruntime: {ort.__version__}'); \
+avail = ort.get_available_providers(); print(f'ORT providers: {avail}'); \
+assert 'CUDAExecutionProvider' in avail, f'CUDA EP not available: {avail}'; \
+import importlib.metadata; v = importlib.metadata.version('llama-cpp-python'); print(f'llama-cpp-python: {v} (installed, runtime load with nvidia driver)'); \
+import scipy; print(f'scipy: {scipy.__version__}'); \
+import sounddevice; print(f'sounddevice: {sounddevice.__version__}'); \
+print('BUILD VERIFICATION: ALL PASS')" 2>&1 \
+    && echo "Orchestrator image build OK"
+
+# Copy application code
+COPY orchestrator/ /app/orchestrator/
+WORKDIR /app
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/cuda

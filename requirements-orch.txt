@@ -1,0 +1,181 @@
+# Athena Xai v1
+
+A self-hosted voice assistant for the **Jetson Orin Nano Super 8GB** (JetPack 6.2 / L4T R36.4 / CUDA 12.6). Runs entirely on the device — no cloud, no external APIs, no internet at runtime.
+
+```
+Mic → Silero VAD (CPU) → Whisper STT (GPU) → Gemma 4 E2B LLM (GPU) → Kokoro-82M TTS (GPU) → Speaker
+```
+
+Three Docker containers share the GPU:
+
+| Container | Role | Port |
+|---|---|---|
+| `athena-orchestrator` | Mic capture, VAD, voice router, LLM (loaded directly via llama-cpp-python), TTS dispatch | — |
+| `athena-whisper` | whisper.cpp small Q8_0 multilingual via HTTP | 8001 |
+| `athena-tts` | Kokoro-82M ONNX via HTTP, GPU-only (no CPU fallback) | 8002 |
+
+---
+
+## What it does
+
+- **Hands-free conversation** — talk to it through a USB headset, hear it back through the same headset.
+- **Adult mode** — flirty/companion personality, separate system prompt.
+- **Per-turn thinking** — say the word "think" anywhere in your sentence and Gemma shows its reasoning out loud for that one turn. Next turn reverts.
+- **Two-person interpreter (Translate Mode)** — Path A: foreign speaker's voice → English on the headset. Path B: your English → foreign target language on a wired USB speaker. Locked language per session, switch with one phrase.
+- **Settings menu by voice** — change voice, voice speed, translation speed, translation voice gender, audio output sink. Persisted across restarts.
+- **100+ Whisper-detectable input languages**. ~30 active output languages on the Path B voice table.
+- **Two-pass output for non-Latin scripts** — Chinese, Japanese, Hindi, Korean, etc. are translated to native script first, then converted to English-letter equivalents in a second LLM pass before TTS. Sidesteps the lack of espeak voices for many of those scripts.
+
+---
+
+## Hardware requirements
+
+- Jetson Orin Nano Super 8GB (or compatible JetPack 6.2 device)
+- USB microphone + USB output device(s):
+  - Recommended: a wireless USB headset (mic + earpiece) AND a wired USB speaker for Path B translate output
+  - Minimum: any USB mic + USB speaker
+- ~12 GB free disk for model weights + container images
+- Stable network during initial build only (containers download Python wheels and apt packages once)
+
+---
+
+## Install
+
+1. Drop the `athena/` folder onto the Jetson at `~/athena/`.
+2. Stage the JetPack CUDA libraries and the onnxruntime-gpu wheel into the build context (the install script will tell you what's missing on first run).
+3. Run the launcher:
+   ```
+   cd ~/athena
+   ./athena.sh
+   ```
+   First run builds three Docker images, downloads the four model files (Gemma 4 GGUF, Whisper, Silero VAD, Kokoro), tunes swap and VM parameters, and brings the stack up. Subsequent runs are fast (everything cached).
+
+The build report is written to `~/athena/logs/build_report.log` after each launch.
+
+---
+
+## Voice commands
+
+### Universal
+
+| Phrase | Effect |
+|---|---|
+| `hey athena` / `okay athena` | Wake from idle, restore previous mode |
+| `athena stop` / `thank you athena` | Sleep — mute TTS, ignore audio for 5 seconds |
+
+### Mode switching
+
+| Phrase | Effect |
+|---|---|
+| `athena adult mode` | Switch from conversation to adult (history wiped) |
+| `athena normal mode` | Switch from adult to conversation (history wiped) |
+| `athena translation mode` | Enter translate mode (waits for a language name) |
+| *say a language* (e.g. `Spanish`, `Japanese`) | Lock the translate target language |
+| `athena unlock language` | Clear the translate language without leaving translate mode |
+| `athena stop translating` / `athena stop translation` / `athena stop translate` | Leave translate mode → back to conversation |
+| `athena settings` | Open the settings voice menu |
+
+### Settings menu
+
+After saying `athena settings`, choose one:
+
+| Phrase | What it does |
+|---|---|
+| `audio output` | Switch between `headphones` and `speaker` for conversation/adult output |
+| `voice` | Pick from `sky`, `heart`, `bella`, `nicole`, `michael`, `puck`, `fenrir`, `emma`, `fable` |
+| `voice speed` | Pick a number 1–9 (5 = normal, ±0.08 per step) |
+| `translation speed` | Same 1–9 grid, separate setting |
+| `translation voice` | `male` or `female` — applies globally to all translate targets |
+| `options` / `menu` / `help` | Replay the menu prompt |
+| `exit settings` / `done` | Leave settings, return to previous mode |
+
+### Per-turn thinking
+
+In conversation or adult mode, just include the word **think** anywhere in your prompt and that one turn shows reasoning. Next turn reverts unless you say think again.
+
+Examples:
+- "Athena, think about what makes a good poem."
+- "I want you to think this through before answering."
+
+Translate and idle modes ignore it.
+
+### Translate mode — dual-channel routing
+
+| Direction | Plays on |
+|---|---|
+| Foreign speaker → English (Path A) | Headset (always) |
+| English speaker → Foreign target (Path B) | Wired USB speaker (always) |
+
+Audio output `Settings` only affects conversation/adult mode. Translate routing is hard-wired so a two-person interpreter setup just works.
+
+For Chinese, Japanese, Hindi, Korean, and other non-Latin script targets, Path B runs a two-pass LLM flow (translate, then convert to English letters) and Kokoro speaks the result through the English phonemizer using an American voice — `am_michael` if your translation gender is male, `af_heart` if female. The voices come from the `path_b_voice_table` directly. Latency cost: roughly +1.5–3 seconds per turn vs. single-pass Spanish/French/Italian/etc.
+
+### Wake-word fuzzing
+
+Whisper sometimes mishears "athena" as "a theme", "a theme a", or "the theme". Every command above accepts those variants automatically.
+
+---
+
+## Persistence
+
+Voice settings and language gender persist to `~/athena/logs/.athena_runtime.json`. Delete that file to reset to defaults:
+
+| Setting | Default |
+|---|---|
+| Audio output | headset |
+| Voice | af_sky |
+| Voice speed step | 5 (1.00×) |
+| Translation speed step | 3 (0.84×) |
+| Translation voice gender | male |
+
+---
+
+## Logs
+
+All logs land in `~/athena/logs/`:
+
+| File | Contents |
+|---|---|
+| `pipeline.log` | Primary orchestrator events, transcription, LLM, TTS, mode switches |
+| `translation.log` | Path A and Path B turn records (English ↔ foreign) |
+| `memory_phases.log` | Host + in-container memory snapshots at each lifecycle phase |
+| `whisper.log` | Whisper container output |
+| `tts.log` | Kokoro TTS container output |
+| `orchestrator.log` | Full orchestrator container stdout |
+| `build_report.log` | Most recent build pass/fail summary |
+| `.athena_runtime.json` | Persisted settings |
+
+`memory_diag.sh` (host-side) generates the snapshots that feed `memory_phases.log` and can be run on demand for a free-space report.
+
+---
+
+## Stop / restart / utility scripts
+
+```
+~/athena/stop_athena.sh        # take everything down, free GPU memory
+~/athena/athena.sh             # bring everything back up (also rebuilds if needed)
+~/athena/test_athena.sh        # health-check all three services
+~/athena/preview_voices.sh     # audition each Kokoro voice
+~/athena/chat_athena.sh        # text-only REPL into the running orchestrator
+~/athena/memory_diag.sh        # full memory report (host-side)
+```
+
+---
+
+## Sampling parameters
+
+The LLM uses Gemma 4's officially recommended sampling only:
+
+| Param | Value |
+|---|---|
+| temperature | 1.0 |
+| top_p | 0.95 |
+| top_k | 64 |
+
+No penalties, no max_tokens cap. Configurable in `llm_config.json`.
+
+---
+
+## File-by-file inventory
+
+See `FILES.md` for a per-file description of every script and source file in this package and how each fits into the pipeline.
